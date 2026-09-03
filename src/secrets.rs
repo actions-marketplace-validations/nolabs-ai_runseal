@@ -1,10 +1,18 @@
-use crate::config::RunConfig;
+//! Credential sealing for sandboxed runs.
+
+use crate::config::{RunConfig, SupportedInjectMode};
 use anyhow::{bail, Context, Result};
 use std::collections::{BTreeMap, HashSet};
 use std::env;
+use std::ffi::OsString;
 use std::fs;
+use std::io::{self, Write};
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
 use tempfile::TempDir;
+use zeroize::Zeroizing;
+
+const MASK_PREFIX: &str = "::add-mask::";
 
 #[derive(Debug)]
 pub struct SealedCredentials {
@@ -19,7 +27,7 @@ pub struct SealedCredential {
     pub secret_env: String,
     pub upstream: String,
     pub tls_ca: Option<String>,
-    pub inject_mode: String,
+    pub inject_mode: SupportedInjectMode,
     pub credential_file: std::path::PathBuf,
     pub endpoint_rules: Vec<crate::config::EndpointRule>,
 }
@@ -31,16 +39,7 @@ pub fn seal_credentials(config: &RunConfig) -> Result<SealedCredentials> {
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
 
     let secret_names: HashSet<&str> = config.access.iter().map(|c| c.secret.as_str()).collect();
-    let sanitized_env: BTreeMap<String, String> = env::vars_os()
-        .filter_map(|(key, value)| {
-            let key = key.into_string().ok()?;
-            let value = value.into_string().ok()?;
-            Some((key, value))
-        })
-        .filter(|(key, _)| !secret_names.contains(key.as_str()))
-        .filter(|(key, _)| !key.starts_with("RUNSEAL_"))
-        .filter(|(key, _)| !key.starts_with("NONO_ACTION_"))
-        .collect();
+    let sanitized_env = sanitize_env(&secret_names);
 
     let mut sealed = Vec::new();
     for grant in &config.access {
@@ -50,8 +49,8 @@ pub fn seal_credentials(config: &RunConfig) -> Result<SealedCredentials> {
         if secret.is_empty() {
             bail!("access secret env var '{}' is empty", grant.secret);
         }
-        validate_secret_for_inject_mode(&grant.secret, &grant.inject_mode, &secret)?;
-        emit_secret_masks(&secret);
+        validate_secret_for_inject_mode(&grant.secret, grant.inject_mode, &secret)?;
+        emit_secret_masks(&secret)?;
 
         let name = grant.name.clone();
         let path = dir.path().join(&name);
@@ -63,7 +62,7 @@ pub fn seal_credentials(config: &RunConfig) -> Result<SealedCredentials> {
             secret_env: grant.secret.clone(),
             upstream: grant.upstream.clone(),
             tls_ca: grant.tls_ca.clone(),
-            inject_mode: grant.inject_mode.clone(),
+            inject_mode: grant.inject_mode,
             credential_file: path,
             endpoint_rules: grant.endpoint_rules.clone(),
         });
@@ -76,16 +75,56 @@ pub fn seal_credentials(config: &RunConfig) -> Result<SealedCredentials> {
     })
 }
 
-fn read_secret_env(secret_env: &str) -> Result<String> {
+/// Sanitize the environment, discarding secrets and internal inputs.
+fn sanitize_env(secret_names: &HashSet<&str>) -> BTreeMap<String, String> {
+    let mut sanitized = BTreeMap::new();
+    for (key, value) in env::vars_os() {
+        let Ok(key) = key.into_string() else {
+            discard_secret_bytes(value);
+            continue;
+        };
+        if !is_forwarded_env_key(&key, secret_names) {
+            discard_secret_bytes(value);
+            continue;
+        }
+        match value.into_string() {
+            Ok(value) => {
+                sanitized.insert(key, value);
+            }
+            Err(value) => discard_secret_bytes(value),
+        }
+    }
+    sanitized
+}
+
+/// Whether an environment variable may be forwarded into the sandbox.
+///
+/// Secrets are withheld because the credential proxy injects them instead, and
+/// runseal's own inputs are withheld because the sandboxed command has no
+/// business reading the policy it is confined by.
+fn is_forwarded_env_key(key: &str, secret_names: &HashSet<&str>) -> bool {
+    !secret_names.contains(key) && !key.starts_with("RUNSEAL_") && !key.starts_with("NONO_ACTION_")
+}
+
+/// Zeroize the provided OsString.
+fn discard_secret_bytes(value: OsString) {
+    drop(Zeroizing::new(value.into_vec()));
+}
+
+fn read_secret_env(secret_env: &str) -> Result<Zeroizing<String>> {
     let value = env::var_os(secret_env)
         .with_context(|| format!("access secret env var '{secret_env}' is not set"))?;
     decode_secret_env_value(secret_env, value)
 }
 
-fn decode_secret_env_value(secret_env: &str, value: std::ffi::OsString) -> Result<String> {
+/// Read and decode a secret environment variable.
+fn decode_secret_env_value(secret_env: &str, value: OsString) -> Result<Zeroizing<String>> {
     match value.into_string() {
-        Ok(value) => Ok(value),
-        Err(_) => bail!("access secret env var '{secret_env}' is not valid UTF-8"),
+        Ok(value) => Ok(Zeroizing::new(value)),
+        Err(value) => {
+            discard_secret_bytes(value);
+            bail!("access secret env var '{secret_env}' is not valid UTF-8")
+        }
     }
 }
 
@@ -107,10 +146,16 @@ fn validate_access_grant_name(name: &str) -> Result<()> {
 
 fn validate_secret_for_inject_mode(
     secret_env: &str,
-    inject_mode: &str,
+    inject_mode: SupportedInjectMode,
     secret: &str,
 ) -> Result<()> {
-    if inject_mode == "header" && secret.contains(['\r', '\n']) {
+    let secret_lands_in_header_verbatim = match inject_mode {
+        SupportedInjectMode::Header => true,
+        // nono base64-encodes basic_auth secrets, so a newline never reaches
+        // the header.
+        SupportedInjectMode::BasicAuth => false,
+    };
+    if secret_lands_in_header_verbatim && secret.contains(['\r', '\n']) {
         bail!(
             "access secret env var '{secret_env}' contains a newline, which cannot be injected as an HTTP header"
         );
@@ -118,10 +163,31 @@ fn validate_secret_for_inject_mode(
     Ok(())
 }
 
-fn emit_secret_masks(secret: &str) {
+fn emit_secret_masks(secret: &str) -> Result<()> {
+    let mut stdout = io::stdout().lock();
     for line in secret_mask_lines(secret) {
-        println!("::add-mask::{line}");
+        let masked = mask_line(line);
+        stdout
+            .write_all(masked.as_bytes())
+            .context("failed to write secret mask")?;
     }
+    // Masks must reach the log before the secret can appear anywhere else.
+    stdout.flush().context("failed to flush secret masks")?;
+    Ok(())
+}
+
+/// Render a newline-terminated mask command.
+fn mask_line(line: &str) -> Zeroizing<String> {
+    let mut masked = Zeroizing::new(String::with_capacity(
+        MASK_PREFIX
+            .len()
+            .saturating_add(line.len())
+            .saturating_add(1),
+    ));
+    masked.push_str(MASK_PREFIX);
+    masked.push_str(line);
+    masked.push('\n');
+    masked
 }
 
 fn secret_mask_lines(secret: &str) -> impl Iterator<Item = &str> {
@@ -131,7 +197,7 @@ fn secret_mask_lines(secret: &str) -> impl Iterator<Item = &str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AccessConfig, AuditConfig, NetworkPolicy};
+    use crate::config::{AccessConfig, AuditConfig, NetworkPolicy, SupportedInjectMode};
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
 
@@ -173,7 +239,7 @@ mod tests {
                 secret: "RUNSEAL_TEST_SECRET_THAT_IS_NOT_SET".to_string(),
                 upstream: "https://crates.io".to_string(),
                 tls_ca: None,
-                inject_mode: "header".to_string(),
+                inject_mode: SupportedInjectMode::Header,
                 endpoint_rules: Vec::new(),
             }],
             audit: AuditConfig::Disabled,
@@ -209,6 +275,54 @@ mod tests {
     }
 
     #[test]
+    fn utf8_secret_decodes_into_scrubbing_string() {
+        let value = OsString::from("s3cret-value");
+
+        let secret = decode_secret_env_value("RUNSEAL_TEST_SECRET", value).expect("utf-8 secret");
+
+        assert_eq!(&*secret, "s3cret-value");
+    }
+
+    #[test]
+    fn forwards_ordinary_env_keys_to_the_sandbox() {
+        let secret_names = HashSet::from(["CARGO_REGISTRY_TOKEN"]);
+
+        for key in ["PATH", "HOME", "GITHUB_WORKSPACE", "RUNSEALED", "NONO_HOME"] {
+            assert!(
+                is_forwarded_env_key(key, &secret_names),
+                "expected {key} to be forwarded"
+            );
+        }
+    }
+
+    #[test]
+    fn withholds_secret_and_runseal_env_keys_from_the_sandbox() {
+        let secret_names = HashSet::from(["CARGO_REGISTRY_TOKEN"]);
+
+        for key in [
+            "CARGO_REGISTRY_TOKEN",
+            "RUNSEAL_ACCESS",
+            "RUNSEAL_",
+            "NONO_ACTION_PROFILE",
+        ] {
+            assert!(
+                !is_forwarded_env_key(key, &secret_names),
+                "expected {key} to be withheld"
+            );
+        }
+    }
+
+    #[test]
+    fn mask_line_is_newline_terminated_and_exactly_sized() {
+        let masked = mask_line("s3cret-value");
+
+        assert_eq!(&*masked, "::add-mask::s3cret-value\n");
+        // An exact capacity means no reallocation left a copy of the secret
+        // behind in a buffer nothing scrubs.
+        assert_eq!(masked.capacity(), masked.len());
+    }
+
+    #[test]
     fn masks_each_non_empty_line_of_multiline_secret() {
         let lines: Vec<_> = secret_mask_lines("first\n\nsecond\r\nthird\r").collect();
 
@@ -217,8 +331,12 @@ mod tests {
 
     #[test]
     fn header_injection_rejects_newline_secrets() {
-        let err = validate_secret_for_inject_mode("RUNSEAL_TEST_SECRET", "header", "first\nsecond")
-            .expect_err("header secrets with newlines must fail");
+        let err = validate_secret_for_inject_mode(
+            "RUNSEAL_TEST_SECRET",
+            SupportedInjectMode::Header,
+            "first\nsecond",
+        )
+        .expect_err("header secrets with newlines must fail");
 
         assert!(
             err.to_string()
@@ -228,8 +346,12 @@ mod tests {
     }
 
     #[test]
-    fn non_header_injection_allows_newline_secrets() {
-        validate_secret_for_inject_mode("RUNSEAL_TEST_SECRET", "body", "first\nsecond")
-            .expect("non-header multiline secret");
+    fn basic_auth_injection_allows_newline_secrets() {
+        validate_secret_for_inject_mode(
+            "RUNSEAL_TEST_SECRET",
+            SupportedInjectMode::BasicAuth,
+            "first\nsecond",
+        )
+        .expect("basic_auth multiline secret");
     }
 }

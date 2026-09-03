@@ -16,7 +16,7 @@
 
 Runseal was built to solve the problem of software supply chain attacks that are often triggered from GitHub Actions-based exploits.
 
-We built runseal in response to the rise of supply chain attacks targeting GitHub Actions, where attackers often gain access to repository secrets and use them to exfiltrate data or deploy malicious code. By using [nono's](https://github.com/always-further/nono) kernel-enforced sandboxing, runseal can protect sensitive files, secrets/tokens, and filter network access from untrusted or malicious code, while still allowing necessary software engineering operations through a flexible policy system.
+We built runseal in response to the rise of supply chain attacks targeting GitHub Actions, where attackers often gain access to repository secrets and use them to exfiltrate data or deploy malicious code. By using [nono's](https://github.com/nolabs-ai/nono) kernel-enforced sandboxing, runseal can protect sensitive files, secrets/tokens, and filter network access from untrusted or malicious code, while still allowing necessary software engineering operations through a flexible policy system.
 
 From the same folks who brought you [sigstore](https://sigstore.dev) and [nono](https://nono.sh).
 
@@ -46,7 +46,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: always-further/runseal@v0.3.3
+      - uses: nolabs-ai/runseal@v0.3.3
         with:
           run: npm publish
           policy: |
@@ -114,6 +114,8 @@ Runseal expects `network.mode: blocked` or `network.mode: filtered`.
 
 Add `network.allow` only for unauthenticated hosts the command must reach. Hosts
 used by access grants are added to the generated `nono` profile automatically.
+A `network.allow` list implies `mode: filtered` when `mode` is omitted;
+combining it with an explicit `mode: blocked` is a configuration error.
 
 ```yaml
 network:
@@ -128,7 +130,9 @@ Each key under `access` is a named grant. `secret` is the environment variable
 containing the real secret, `url` is the service base URL, and `allow` lists the
 HTTP routes where the secret may be injected. Runseal masks the secret in logs,
 writes it to a private file, removes it from the child environment, and
-configures `nono` to inject it through the local proxy.
+configures `nono` to inject it through the local proxy. Runseal's own copy of
+the plaintext is zeroed out of memory once the credential file is written, and
+on every error path in between.
 
 ```yaml
 access:
@@ -143,10 +147,31 @@ The sandboxed command receives a phantom credential for SDK compatibility. The
 real secret remains outside the sandbox and is only inserted by the proxy when
 the host and endpoint policy match.
 
+`inject.mode` selects how the proxy injects the secret:
+
+| Mode | Status | Behavior |
+| --- | --- | --- |
+| `header` | Default | Injected as an `Authorization: Bearer` header. |
+| `basic_auth` | Supported | Injected as HTTP basic auth credentials. |
+| `url_path` | Reserved | Rejected; runseal does not emit the required `path_pattern` yet. |
+| `query_param` | Reserved | Rejected; runseal does not emit the required `query_param_name` yet. |
+
+```yaml
+access:
+  fly:
+    secret: FLY_API_TOKEN
+    url: https://api.machines.dev
+    inject:
+      mode: header
+    allow:
+      - POST /v1/apps/*/machines
+```
+
 ### HTTPS Endpoint Filtering
 
 `allow` restricts access use by HTTP method and path. Matching is allow-list
-based.
+based. The method may be any HTTP method token (`GET`, `DELETE`, `PROPFIND`,
+...) or the wildcard `*`; methods are uppercased before matching.
 
 ```yaml
 allow:
@@ -164,7 +189,7 @@ still allowing L7 policy enforcement.
 ### Run Tests With No Network
 
 ```yaml
-- uses: always-further/runseal@v0.3.2
+- uses: nolabs-ai/runseal@v0.3.3
   with:
     run: npm test
     policy: |
@@ -178,7 +203,7 @@ still allowing L7 policy enforcement.
 ### Build With Package Registry Access
 
 ```yaml
-- uses: always-further/runseal@v0.3.2
+- uses: nolabs-ai/runseal@v0.3.3
   with:
     run: npm ci
     policy: |
@@ -194,7 +219,7 @@ still allowing L7 policy enforcement.
 ### Deploy With A Sealed Token
 
 ```yaml
-- uses: always-further/runseal@v0.3.2
+- uses: nolabs-ai/runseal@v0.3.3
   with:
     run: ./scripts/deploy.sh
     policy: |
@@ -222,8 +247,8 @@ still allowing L7 policy enforcement.
 | `policy` | No | empty | Runseal policy YAML. Prefer this for new workflows. |
 | `fs-read` | No | empty | Comma-separated read paths when `policy` is not set. |
 | `fs-write` | No | empty | Comma-separated write paths when `policy` is not set. |
-| `network` | No | `blocked` | Network policy when `policy` is not set: `blocked` or comma-separated domains. |
-| `runseal-version` | No | `0.3.1` | Runseal release version to install. Accepts `v0.1.0` or `0.1.0`. |
+| `network` | No | `blocked` | Network policy when `policy` is not set: `blocked` or comma-separated domains. `filtered` is only valid as `network.mode` inside `policy` and is rejected here. |
+| `runseal-version` | No | `0.3.3` | Runseal release version to install. Accepts `v0.1.0` or `0.1.0`. |
 | `nono-version` | No | `0.62.0` | nono release version to install. Accepts `v0.1.0` or `0.1.0`. |
 | `verify-attestations` | No | `true` | Verify GitHub artifact attestations for downloaded release assets. |
 | `audit` | No | `false` | Set to `artifact` or `true` to upload nono audit evidence as a GitHub Actions artifact. |
@@ -233,7 +258,7 @@ still allowing L7 policy enforcement.
 Runseal can export the nono audit session for a sandboxed command:
 
 ```yaml
-- uses: always-further/runseal@v0.3.2
+- uses: nolabs-ai/runseal@v0.3.3
   with:
     run: npm rebuild
     audit: artifact
