@@ -13,6 +13,10 @@ inputs:
     description: "Runseal policy YAML"
     required: false
     default: ""
+  profile:
+    description: "Path to a nono profile committed in the repository, relative to the workspace (for example runseal.json). Mutually exclusive with policy, fs-read, fs-write, and network."
+    required: false
+    default: ""
   fs-read:
     description: "Comma-separated paths to allow read access when policy is not set"
     required: false
@@ -22,17 +26,17 @@ inputs:
     required: false
     default: ""
   network:
-    description: "Network policy when policy is not set: blocked or comma-separated domain allowlist"
+    description: "Network policy when policy is not set: blocked or comma-separated domain allowlist. Defaults to blocked when empty."
     required: false
-    default: "blocked"
+    default: ""
   runseal-version:
     description: "Runseal version to install, without or with leading v"
     required: false
-    default: "0.3.3"
+    default: "0.3.4"
   nono-version:
-    description: "nono version to install, without or with leading v"
+    description: "nono version to install. Defaults to the Dependabot-managed pin."
     required: false
-    default: "0.62.0"
+    default: ""
   verify-attestations:
     description: "Verify GitHub artifact attestations for downloaded runseal and nono release assets"
     required: false
@@ -56,10 +60,11 @@ runs:
         GH_TOKEN: ${{ github.token }}
     - name: Run sealed command
       shell: bash
-      run: runseal run
+      run: bash "${{ github.action_path }}/scripts/run-sealed.sh"
       env:
         RUNSEAL_RUN: ${{ inputs.run }}
         RUNSEAL_POLICY: ${{ inputs.policy }}
+        RUNSEAL_PROFILE: ${{ inputs.profile }}
         RUNSEAL_FS_READ: ${{ inputs.fs-read }}
         RUNSEAL_FS_WRITE: ${{ inputs.fs-write }}
         RUNSEAL_NETWORK: ${{ inputs.network }}
@@ -67,7 +72,7 @@ runs:
         RUNSEAL_AUDIT_DIR: ${{ runner.temp }}/runseal-audit
     - name: Upload Runseal audit
       if: ${{ always() && (inputs.audit == 'artifact' || inputs.audit == 'true') }}
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
         name: runseal-audit
         path: ${{ runner.temp }}/runseal-audit
